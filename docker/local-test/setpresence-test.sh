@@ -107,7 +107,7 @@ cat <<EOF
          -H "apikey: $GLOBAL_API_KEY" -H 'Content-Type: application/json' \\
          -d '{"presence":"unavailable"}'
        expect {"presence":"unavailable"}
-    3. docker compose --profile ab --env-file .env logs evo-fixed \\
+    3. docker compose --env-file .env logs evo-1 evo-2 \\
          | grep "Global presence set to"
 EOF
 

@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Licenses both local servers OFFLINE, by writing your existing licence into
-# each server's runtime_configs table and restarting them.
+# Licenses every local server OFFLINE, by writing your existing licence into
+# each SIDE's users database and restarting the containers.
+#
+# Only two seeds are needed for four servers: the replicas of a side share one
+# users database, so they share the licence row too.
 #
 # Why not just let them self-register? Each fresh container would mint its own
-# identity and call the licensing server, so a two-server stack would burn TWO
-# new activations against your account — and two more on every volume wipe.
+# identity and call the licensing server, so this stack would burn FOUR new
+# activations against your account — and four more on every volume wipe.
 # Seeding one shared api_key + instance_id collapses the whole stack to a single
 # identity that is reused across runs. Point EVOLUTION_INSTANCE_ID at an install
 # you have already activated to register nothing new at all.
 #
-# Requires: the stack to have booted once already (that is what creates the
+# Requires the stack to have booted once (that is what creates the
 # runtime_configs table), which start.sh does for you.
 set -euo pipefail
 
@@ -22,7 +25,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Reuse the stored instance id, or mint one and persist it for later runs.
 if [ -z "${EVOLUTION_INSTANCE_ID:-}" ]; then
   EVOLUTION_INSTANCE_ID="$(gen_uuid)"
-  # Portable in-place edit (BSD/GNU sed disagree on -i).
   tmp="$HERE/.env.tmp"
   sed "s|^EVOLUTION_INSTANCE_ID=.*|EVOLUTION_INSTANCE_ID=$EVOLUTION_INSTANCE_ID|" \
     "$HERE/.env" > "$tmp" && mv "$tmp" "$HERE/.env"
@@ -60,36 +62,28 @@ SQL
   echo "==> $db: licence seeded"
 }
 
-targets=()
-running evo-fixed    && targets+=("evo-fixed:users_fixed:$FIXED_PORT")
-running evo-baseline && targets+=("evo-baseline:users_baseline:$BASELINE_PORT")
+seed_db users_fixed
+seed_db users_baseline
 
-if [ ${#targets[@]} -eq 0 ]; then
-  echo "error: no evo-* service is running — run ./start.sh first" >&2
-  exit 1
-fi
-
-for t in "${targets[@]}"; do
-  IFS=: read -r _svc db _port <<<"$t"
-  seed_db "$db"
-done
-
-echo "==> restarting so the servers pick the licence up"
-for t in "${targets[@]}"; do
-  dc restart "${t%%:*}" >/dev/null
+echo "==> restarting all servers so they pick the licence up"
+for svc in "${ALL_SERVICES[@]}"; do
+  running "$svc" && dc restart "$svc" >/dev/null || true
 done
 
 echo
-for t in "${targets[@]}"; do
-  svc="${t%%:*}"; port="${t##*:}"
+for pair in "${FIXED_REPLICAS[@]}" "${BASE_REPLICAS[@]}"; do
+  svc="${pair%%:*}"; port="${pair##*:}"
   echo -n "==> $svc licence status: "
+  s=""
   for _ in $(seq 1 45); do
     s="$(curl -s "http://localhost:$port/license/status" 2>/dev/null || true)"
     case "$s" in
-      *'"active"'*)   echo "ACTIVE";  break ;;
-      *'"inactive"'*) echo -n "." ; sleep 2 ;;
-      *)              echo -n "." ; sleep 2 ;;
+      *'"active"'*) break ;;
+      *)            echo -n "." ; sleep 2 ;;
     esac
   done
-  case "${s:-}" in *'"active"'*) ;; *) echo " STILL INACTIVE — check: dc logs $svc" ;; esac
+  case "$s" in
+    *'"active"'*) echo "ACTIVE" ;;
+    *)            echo " STILL INACTIVE — check: ./dc.sh logs $svc" ;;
+  esac
 done

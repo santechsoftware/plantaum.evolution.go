@@ -1,15 +1,22 @@
 # Local test harness
 
-Runs **two** Evolution Go servers side by side against one Postgres:
+Runs **four** Evolution Go servers against one Postgres — two replicas of each
+side, no compose profiles, so `docker compose up -d` starts all of them:
 
-| service | image built from | why |
+| service | port | image built from |
 |---|---|---|
-| `evo-fixed` | your working tree | has the auth-pool fix + `setPresence` |
-| `evo-baseline` | `9337afc` (upstream 0.7.2 sync) | the same code *without* the fix |
+| `evo-1` | 8080 | your working tree (auth-pool fix + `setPresence`) |
+| `evo-2` | 8082 | same |
+| `evo-base-1` | 8081 | `9337afc` (upstream 0.7.2 sync), *without* the fix |
+| `evo-base-2` | 8083 | same |
 
-Each gets its own `auth_*` / `users_*` database, so every Postgres backend
-connection can be attributed to one server. That is what turns "the pool leak is
-fixed" from a claim into a number you can read off.
+The two replicas of a side **share one database pair and one Postgres role**,
+which is the production shape: N replicas of the image behind a load balancer,
+one database, one connection budget between them. Connections are attributed on
+two axes — `datname` says which side, `application_name` says which replica.
+
+That is what turns "the pool leak is fixed" from a claim into a number you can
+read off.
 
 ## Requirements
 
@@ -60,37 +67,46 @@ non-blocking, so this all works offline too.
 ## The pool leak test
 
 ```bash
-./pool-leak-test.sh        # 30 instances per server
+./pool-leak-test.sh        # 30 instances per side
 ./pool-leak-test.sh 70     # past the 60-connection role budget: baseline dies
 ```
 
-Connections leak *within* a process, so they reset when a container restarts.
-Counts therefore accumulate across repeated runs until you restart or
-`./stop.sh --clean`.
+It creates N instances per side and connects each one — N `StartClient()` calls,
+spread round-robin across that side's two replicas the way a load balancer would
+— then counts backends per auth database.
 
-It creates N instances on each server and connects each one, which is N
-`StartClient()` calls per server, then counts backends per auth database.
+Leaked connections belong to the process that opened them, so they are freed on
+container restart. The script **restarts all four servers first**, so every run
+starts clean and repeats identically. Pass `--no-restart` to measure cumulative
+state instead.
 
 Real output from `./pool-leak-test.sh 70`:
 
 ```
                              before   after    delta
-  auth_baseline (pre-fix)    1        57       +56
-  auth_fixed    (post-fix)   1        1        +0
+  auth_baseline (pre-fix)    2        57       +55
+  auth_fixed    (post-fix)   2        4        +2
 
-  PASS  70 connects added 0 backends on fixed vs 56 on baseline
+  PASS  70 connects added 2 backends on fixed vs 55 on baseline
         fixed does not scale with instance count; baseline does
 
-  Postgres "out of connection slots" errors logged by each server:
-    evo-baseline   x13
-    evo-fixed      x0
+  per replica (application_name):
+    evo-1        3 backends
+    evo-2        4 backends
+    evo-base-1   30 backends
+    evo-base-2   30 backends
+
+  Postgres "out of connection slots" errors, summed per side:
+    baseline     x16
+    fixed        x0
 
   PASS  baseline burned through its connection budget; fixed never did
 ```
 
-Those 13 errors are `FATAL: too many connections for role "evo_baseline"` —
-the same exhaustion as the production `sorry, too many clients already`, just
-worded for the per-role cap described below.
+Note both baseline replicas leak ~30 each into the *shared* budget — that is the
+compounding this harness exists to show. Those 16 errors are
+`FATAL: too many connections for role "evo_baseline"`, the same exhaustion as the
+production `sorry, too many clients already`, worded for the per-role cap.
 
 Read the **delta**, not the absolute number. Both servers open one capped pool
 at boot (`main.go` `initPostgresAuthDB`), so neither ever sits at zero. The
@@ -106,18 +122,19 @@ every connect and every reconnect, each opening a fresh `*sql.DB` with no
 `MaxOpenConns` cap that was never closed. Post-fix a single container with
 `MaxOpenConns=20` is shared by all instances, so the count plateaus.
 
-### Why the two servers cannot contaminate each other
+### Why the two sides cannot contaminate each other
 
-Each server logs in as its own Postgres role with its own `CONNECTION LIMIT`
-(`PG_ROLE_CONN_LIMIT`, default 60), set up by `init-db.sh`. So when the baseline
-leaks its budget away it exhausts **itself**, and the fixed server keeps working.
+Each *side* logs in as its own Postgres role with its own `CONNECTION LIMIT`
+(`PG_ROLE_CONN_LIMIT`, default 60), set up by `init-db.sh`, shared by that
+side's two replicas. So when the baseline leaks its budget away it exhausts
+**itself**, and the fixed side keeps working.
 
-Without that, both servers share one global ceiling and the baseline's leak
-starves the fixed server too — which makes the fixed server log connection
-errors it did not cause, and the comparison stops meaning anything.
+Without that, everything shares one global ceiling and the baseline's leak
+starves the fixed servers too — which makes them log connection errors they did
+not cause, and the comparison stops meaning anything.
 
 The `postgres` superuser sits outside both budgets, so `./conns.sh` can always
-get in to measure, even while a server is fully exhausted.
+get in to measure, even while a side is fully exhausted.
 
 ### Reproducing the boot storm
 
@@ -126,11 +143,13 @@ at once:
 
 ```bash
 sed -i 's/^CONNECT_ON_STARTUP=.*/CONNECT_ON_STARTUP=true/' .env
-docker compose --profile ab --env-file .env up -d --force-recreate
+docker compose --env-file .env up -d --force-recreate
 ./conns.sh
 ```
 
-Baseline opens one pool per stored instance during boot; fixed opens one total.
+Each baseline replica opens one pool per stored instance during boot; each fixed
+replica opens one total. Run `./pool-leak-test.sh` first so there are instances
+stored to reconnect.
 
 ## The setPresence test
 
@@ -148,24 +167,26 @@ endpoint, then check the log line `Global presence set to ...`.
 ## Handy
 
 ```bash
-./conns.sh     # current backends per database
-./stop.sh      # stop, keep data
+./conns.sh          # backends per database, per replica, and the role limits
+./stop.sh           # stop, keep data
 ./stop.sh --clean   # stop, wipe pgdata (licence must be re-seeded)
 ```
 
 Direct compose access:
 
 ```bash
-docker compose --profile ab --env-file .env logs -f evo-fixed
-docker compose --profile ab --env-file .env exec postgres psql -U postgres
+docker compose --env-file .env logs -f evo-1
+docker compose --env-file .env exec postgres psql -U postgres
 ```
 
 ## Ports
 
 | what | where |
 |---|---|
-| fixed | http://localhost:8080 |
-| baseline | http://localhost:8081 |
+| `evo-1` (fixed) | http://localhost:8080 |
+| `evo-2` (fixed) | http://localhost:8082 |
+| `evo-base-1` (baseline) | http://localhost:8081 |
+| `evo-base-2` (baseline) | http://localhost:8083 |
 | postgres | localhost:55432 (postgres/postgres) |
 
 Change them in `.env` if they clash.

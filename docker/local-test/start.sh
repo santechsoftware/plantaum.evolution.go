@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Brings the stack up and licenses it. Safe to re-run.
+# Brings all four servers up and licenses them. Safe to re-run.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,14 +12,16 @@ if ! docker image inspect evogo-localtest:fixed >/dev/null 2>&1 ||
   "$HERE/build-images.sh"
 fi
 
-echo "==> starting postgres + evo-fixed + evo-baseline"
-dc up -d
+echo "==> starting postgres + 2 fixed replicas + 2 baseline replicas"
+dc up -d --remove-orphans
 
-echo -n "==> waiting for both servers to answer "
-for _ in $(seq 1 60); do
-  a="$(http_code "http://localhost:$FIXED_PORT/server/ok"    || true)"
-  b="$(http_code "http://localhost:$BASELINE_PORT/server/ok" || true)"
-  if [ "$a" = "200" ] && [ "$b" = "200" ]; then echo "ok"; break; fi
+echo -n "==> waiting for all four servers to answer "
+for _ in $(seq 1 90); do
+  ok=0
+  for pair in "${FIXED_REPLICAS[@]}" "${BASE_REPLICAS[@]}"; do
+    [ "$(http_code "http://localhost:${pair##*:}/server/ok" || true)" = "200" ] && ok=$((ok + 1))
+  done
+  if [ "$ok" -eq 4 ]; then echo "ok"; break; fi
   echo -n "."
   sleep 2
 done
@@ -29,12 +31,21 @@ echo
 
 cat <<EOF
 
-Ready.
-  fixed     http://localhost:$FIXED_PORT      (working tree, has the pool fix)
-  baseline  http://localhost:$BASELINE_PORT      (pre-fix, for comparison)
-  postgres  localhost:${POSTGRES_PORT:-55432}    (postgres/postgres)
+Ready — 4 API servers, 2 per side.
 
-Next:
+  fixed (working tree, has the pool fix)
+    evo-1        http://localhost:$FIXED_PORT
+    evo-2        http://localhost:$FIXED_PORT_2
+  baseline (pre-fix, for comparison)
+    evo-base-1   http://localhost:$BASELINE_PORT
+    evo-base-2   http://localhost:$BASELINE_PORT_2
+
+  postgres       localhost:${POSTGRES_PORT:-55432}  (postgres/postgres)
+
+Each side's two replicas share one database and one connection budget —
+the production shape. Next:
+
   ./pool-leak-test.sh      prove the leak fix
   ./setpresence-test.sh    exercise POST /instance/setPresence
+  ./conns.sh               connections per database and per replica
 EOF

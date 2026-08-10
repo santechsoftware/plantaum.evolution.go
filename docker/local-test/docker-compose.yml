@@ -1,12 +1,17 @@
 name: evogo-localtest
 
-# Local A/B harness for the auth-pool leak fix.
+# Four API servers, no profiles — `docker compose up -d` starts all of them.
 #
-#   evo-fixed      built from the working tree (has the pool fix)
-#   evo-baseline   built from BASE_COMMIT, i.e. before the fix   [profile: ab]
+#   evo-1, evo-2            working tree (has the pool fix)   ports 8080, 8082
+#   evo-base-1, evo-base-2  BASE_COMMIT, i.e. before the fix  ports 8081, 8083
 #
-# Both talk to the SAME Postgres but to their own auth/users databases, so
-# `pg_stat_activity` can attribute every backend connection to one server.
+# The two replicas on each side SHARE one auth/users database pair and one
+# Postgres role, which is the production shape: N replicas of the image behind a
+# load balancer, one database, one connection budget between them.
+#
+# Attribution works on two axes:
+#   datname          -> which side (fixed vs baseline)
+#   application_name -> which replica (set per-service in the DSN below)
 
 x-evo-env: &evo-env
   SERVER_PORT: 8080
@@ -22,19 +27,23 @@ x-evo-env: &evo-env
   AMQP_GLOBAL_ENABLED: "false"
   OS_NAME: Evolution GO Local Test
 
-x-evo-common: &evo-common
-  restart: unless-stopped
-  depends_on:
-    postgres:
-      condition: service_healthy
+# Replica 1 of each side runs migrations; replica 2 waits for it to serve so the
+# two do not race on AutoMigrate against the same database.
+x-evo-healthcheck: &evo-healthcheck
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/server/ok || exit 1"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 10s
 
 services:
   postgres:
     image: postgres:15
     container_name: evogo-lt-postgres
     # Roomy overall, because the interesting ceiling is per-role: init-db.sh caps
-    # each server's own role at PG_ROLE_CONN_LIMIT, which the pre-fix leak
-    # exhausts within a few dozen instances without touching the other server.
+    # each SIDE's role at PG_ROLE_CONN_LIMIT, shared by that side's two replicas,
+    # so the leaking baseline exhausts itself without touching the fixed side.
     command: ["postgres", "-c", "max_connections=${PG_MAX_CONNECTIONS:-200}"]
     environment:
       POSTGRES_USER: postgres
@@ -51,28 +60,63 @@ services:
       timeout: 3s
       retries: 30
 
-  evo-fixed:
-    <<: *evo-common
+  evo-1:
+    <<: *evo-healthcheck
     image: evogo-localtest:fixed
-    container_name: evogo-lt-fixed
+    container_name: evogo-lt-fixed-1
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "${FIXED_PORT:-8080}:8080"
     environment:
       <<: *evo-env
-      POSTGRES_AUTH_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/auth_fixed?sslmode=disable
-      POSTGRES_USERS_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/users_fixed?sslmode=disable
+      POSTGRES_AUTH_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/auth_fixed?sslmode=disable&application_name=evo-1
+      POSTGRES_USERS_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/users_fixed?sslmode=disable&application_name=evo-1
 
-  evo-baseline:
-    <<: *evo-common
+  evo-2:
+    image: evogo-localtest:fixed
+    container_name: evogo-lt-fixed-2
+    restart: unless-stopped
+    depends_on:
+      evo-1:
+        condition: service_healthy
+    ports:
+      - "${FIXED_PORT_2:-8082}:8080"
+    environment:
+      <<: *evo-env
+      POSTGRES_AUTH_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/auth_fixed?sslmode=disable&application_name=evo-2
+      POSTGRES_USERS_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/users_fixed?sslmode=disable&application_name=evo-2
+
+  evo-base-1:
+    <<: *evo-healthcheck
     image: evogo-localtest:baseline
-    container_name: evogo-lt-baseline
-    profiles: ["ab"]
+    container_name: evogo-lt-base-1
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "${BASELINE_PORT:-8081}:8080"
     environment:
       <<: *evo-env
-      POSTGRES_AUTH_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/auth_baseline?sslmode=disable
-      POSTGRES_USERS_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/users_baseline?sslmode=disable
+      POSTGRES_AUTH_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/auth_baseline?sslmode=disable&application_name=evo-base-1
+      POSTGRES_USERS_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/users_baseline?sslmode=disable&application_name=evo-base-1
+
+  evo-base-2:
+    image: evogo-localtest:baseline
+    container_name: evogo-lt-base-2
+    restart: unless-stopped
+    depends_on:
+      evo-base-1:
+        condition: service_healthy
+    ports:
+      - "${BASELINE_PORT_2:-8083}:8080"
+    environment:
+      <<: *evo-env
+      POSTGRES_AUTH_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/auth_baseline?sslmode=disable&application_name=evo-base-2
+      POSTGRES_USERS_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/users_baseline?sslmode=disable&application_name=evo-base-2
 
 volumes:
   pgdata:
