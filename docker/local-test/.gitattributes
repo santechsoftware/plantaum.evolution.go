@@ -1,0 +1,5 @@
+# These run inside Linux containers (init-db.sh is mounted into postgres) and
+# under Git Bash on Windows. A CRLF checkout breaks them with
+# `$'\r': command not found`, so pin them to LF regardless of core.autocrlf.
+*.sh text eol=lf
+*.yml text eol=lf
