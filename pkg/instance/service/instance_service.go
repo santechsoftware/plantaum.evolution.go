@@ -45,6 +45,7 @@ type InstanceService interface {
 	GetLogs(instanceId string, startDate, endDate time.Time, level string, limit int) ([]logger_wrapper.LogEntry, error)
 	GetAdvancedSettings(instanceId string) (*instance_model.AdvancedSettings, error)
 	UpdateAdvancedSettings(instanceId string, settings *instance_model.AdvancedSettings) error
+	SetPresence(instanceId string, presence string) error
 }
 
 type instances struct {
@@ -908,6 +909,11 @@ func (i instances) UpdateAdvancedSettings(instanceId string, settings *instance_
 
 	i.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Advanced settings updated successfully", instanceId)
 	return nil
+}
+
+func (i instances) SetPresence(instanceId string, presence string) error {
+	i.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Setting global presence to %s", instanceId, presence)
+	return i.whatsmeowService.SetGlobalPresence(instanceId, presence)
 }
 
 func NewInstanceService(

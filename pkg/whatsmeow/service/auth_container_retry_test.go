@@ -7,7 +7,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/EvolutionAPI/evolution-go/pkg/config"
+	"github.com/evolution-foundation/evolution-go/pkg/config"
 )
 
 // Valida a semântica do getAuthContainer compartilhado, usando o caminho SQLite

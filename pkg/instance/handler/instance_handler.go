@@ -30,6 +30,7 @@ type InstanceHandler interface {
 	GetLogs(ctx *gin.Context)
 	GetAdvancedSettings(ctx *gin.Context)
 	UpdateAdvancedSettings(ctx *gin.Context)
+	SetPresence(ctx *gin.Context)
 }
 
 type instanceHandler struct {
@@ -653,6 +654,42 @@ func (h *instanceHandler) UpdateAdvancedSettings(c *gin.Context) {
 		"message":  "Advanced settings updated successfully",
 		"settings": settings,
 	})
+}
+
+type SetPresenceBody struct {
+	Presence string `json:"presence"`
+}
+
+// SetPresence sets global WhatsApp presence (available/unavailable) for an instance.
+// Compatible with Evolution API: POST /instance/setPresence/{instanceId}
+func (h *instanceHandler) SetPresence(c *gin.Context) {
+	instanceId := c.Param("instanceId")
+	if instanceId == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "instanceId is required"})
+		return
+	}
+
+	var body SetPresenceBody
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	presence := body.Presence
+	if presence == "" {
+		presence = "unavailable"
+	}
+	if presence != "available" && presence != "unavailable" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "presence must be available or unavailable"})
+		return
+	}
+
+	if err := h.instanceService.SetPresence(instanceId, presence); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"presence": presence})
 }
 
 func NewInstanceHandler(instanceService instance_service.InstanceService, config *config.Config) InstanceHandler {

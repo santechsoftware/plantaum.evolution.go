@@ -61,6 +61,7 @@ type WhatsmeowService interface {
 	ForceUpdateJid(instanceId string, number string) error
 	UpdateInstanceSettings(instanceId string) error
 	UpdateInstanceAdvancedSettings(instanceId string) error
+	SetGlobalPresence(instanceId string, presence string) error
 	GetPollService() poll_service.PollService // NOVO: Acesso ao serviço de polls
 
 	// Passkey (WebAuthn) pairing bridge — read by the public ceremony endpoint,
@@ -2786,6 +2787,34 @@ func (w whatsmeowService) UpdateInstanceAdvancedSettings(instanceId string) erro
 	myClient.Instance = instance
 
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Advanced settings updated in runtime successfully", instanceId)
+	return nil
+}
+
+func (w whatsmeowService) SetGlobalPresence(instanceId string, presence string) error {
+	myClient, exists := w.myClientPointer[instanceId]
+	if !exists || myClient.WAClient == nil {
+		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] MyClient not found in runtime, instance may not be connected", instanceId)
+		return fmt.Errorf("instance %s not found in runtime", instanceId)
+	}
+	if !myClient.WAClient.IsLoggedIn() {
+		return fmt.Errorf("instance %s is not logged in", instanceId)
+	}
+
+	var p types.Presence
+	switch presence {
+	case "available":
+		p = types.PresenceAvailable
+	default:
+		p = types.PresenceUnavailable
+	}
+
+	err := myClient.WAClient.SendPresence(context.Background(), p)
+	if err != nil {
+		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Failed to send global presence %s: %v", instanceId, presence, err)
+		return err
+	}
+
+	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Global presence set to %s", instanceId, presence)
 	return nil
 }
 
