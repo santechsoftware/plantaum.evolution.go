@@ -1,0 +1,171 @@
+name: evogo-localtest
+
+# Four API servers, no profiles — `docker compose up -d` starts all of them.
+#
+#   evo-1, evo-2            working tree (has the pool fix)   ports 8080, 8082
+#   evo-base-1, evo-base-2  BASE_COMMIT, i.e. before the fix  ports 8081, 8083
+#
+# The two replicas on each side SHARE one auth/users database pair and one
+# Postgres role, which is the production shape: N replicas of the image behind a
+# load balancer, one database, one connection budget between them.
+#
+# Attribution works on two axes:
+#   datname          -> which side (fixed vs baseline)
+#   application_name -> which replica (set per-service in the DSN below)
+
+x-evo-env: &evo-env
+  SERVER_PORT: 8080
+  CLIENT_NAME: ${CLIENT_NAME:-Plantaum}
+  GLOBAL_API_KEY: ${GLOBAL_API_KEY:?set GLOBAL_API_KEY in docker/local-test/.env}
+  DATABASE_SAVE_MESSAGES: "false"
+  WADEBUG: ${WADEBUG:-INFO}
+  LOGTYPE: console
+  # Off by default: instances are connected explicitly by pool-leak-test.sh.
+  # Flip to "true" to reproduce the boot-storm described in the fix commit.
+  CONNECT_ON_STARTUP: ${CONNECT_ON_STARTUP:-false}
+  MINIO_ENABLED: "false"
+  AMQP_GLOBAL_ENABLED: "false"
+  OS_NAME: ${OS_NAME:-Plantaum}
+  # Webhooks. WEBHOOK_URL is deliberately absent — see .env for why the
+  # global webhook never fires on its own.
+  WEBHOOK_FILES: ${WEBHOOK_FILES:-false}
+  EVENT_IGNORE_STATUS: ${EVENT_IGNORE_STATUS:-true}
+  EVENT_IGNORE_GROUP: ${EVENT_IGNORE_GROUP:-false}
+
+# The API under test runs on the HOST, not in this stack, so every server needs a
+# route back to it. Docker Desktop resolves host.docker.internal on its own; this
+# mapping is what makes the same compose file work on plain Linux and in WSL.
+x-evo-hosts: &evo-hosts
+  - "host.docker.internal:host-gateway"
+
+# Replica 1 of each side runs migrations; replica 2 waits for it to serve so the
+# two do not race on AutoMigrate against the same database.
+x-evo-healthcheck: &evo-healthcheck
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/server/ok || exit 1"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 10s
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: evogo-lt-postgres
+    # Roomy overall, because the interesting ceiling is per-role: init-db.sh caps
+    # each SIDE's role at PG_ROLE_CONN_LIMIT, shared by that side's two replicas,
+    # so the leaking baseline exhausts itself without touching the fixed side.
+    command: ["postgres", "-c", "max_connections=${PG_MAX_CONNECTIONS:-200}"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PG_ROLE_CONN_LIMIT: ${PG_ROLE_CONN_LIMIT:-60}
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  evo-1:
+    <<: *evo-healthcheck
+    image: evogo-localtest:fixed
+    container_name: evogo-lt-fixed-1
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${FIXED_PORT:-8080}:8080"
+    extra_hosts: *evo-hosts
+    environment:
+      <<: *evo-env
+      POSTGRES_AUTH_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/auth_fixed?sslmode=disable&application_name=evo-1
+      POSTGRES_USERS_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/users_fixed?sslmode=disable&application_name=evo-1
+
+  evo-2:
+    image: evogo-localtest:fixed
+    container_name: evogo-lt-fixed-2
+    restart: unless-stopped
+    depends_on:
+      evo-1:
+        condition: service_healthy
+    ports:
+      - "${FIXED_PORT_2:-8082}:8080"
+    extra_hosts: *evo-hosts
+    environment:
+      <<: *evo-env
+      POSTGRES_AUTH_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/auth_fixed?sslmode=disable&application_name=evo-2
+      POSTGRES_USERS_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/users_fixed?sslmode=disable&application_name=evo-2
+
+  evo-base-1:
+    <<: *evo-healthcheck
+    image: evogo-localtest:baseline
+    container_name: evogo-lt-base-1
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${BASELINE_PORT:-8081}:8080"
+    extra_hosts: *evo-hosts
+    environment:
+      <<: *evo-env
+      POSTGRES_AUTH_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/auth_baseline?sslmode=disable&application_name=evo-base-1
+      POSTGRES_USERS_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/users_baseline?sslmode=disable&application_name=evo-base-1
+
+  evo-base-2:
+    image: evogo-localtest:baseline
+    container_name: evogo-lt-base-2
+    restart: unless-stopped
+    depends_on:
+      evo-base-1:
+        condition: service_healthy
+    ports:
+      - "${BASELINE_PORT_2:-8083}:8080"
+    extra_hosts: *evo-hosts
+    environment:
+      <<: *evo-env
+      POSTGRES_AUTH_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/auth_baseline?sslmode=disable&application_name=evo-base-2
+      POSTGRES_USERS_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/users_baseline?sslmode=disable&application_name=evo-base-2
+
+  # The cache plantaum.service uses. It lives here rather than in a second
+  # compose file because this is the local stack: one `docker compose up -d`
+  # should give the API everything it talks to, and two stacks means two things
+  # to remember to start and one of them silently forgotten.
+  #
+  # No persistence, deliberately. CLAUDE.md 12 says the cache is an
+  # optimization and never a source of truth, so a local cache that survived a
+  # restart would let a developer depend on state production does not promise.
+  # Losing it must be a non-event.
+  redis:
+    image: redis:7-alpine
+    container_name: evogo-lt-redis
+    restart: unless-stopped
+    ports:
+      # Loopback only. A cache reachable from the LAN is a cache someone else's
+      # machine can read and poison.
+      - "${REDIS_PORT:-6379}:6379"
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+volumes:
+  pgdata:
