@@ -64,6 +64,79 @@ SELECT value FROM runtime_configs WHERE key = 'instance_id';
 The server still fires a background activation notice on boot, but failures are
 non-blocking, so this all works offline too.
 
+## Receiving webhooks locally
+
+`plantaum.service` runs on the **host**, the servers run in this stack, so the
+containers reach it at `host.docker.internal` — the compose file maps that name
+explicitly so the setup also works on plain Linux and in WSL, where Docker
+Desktop's automatic alias does not exist.
+
+Point the service at itself and it does the rest; it sends the URL as
+`webhookUrl` on every `POST /instance/connect`:
+
+```bash
+# from plantaum.service/
+dotnet user-secrets set "EvolutionGo:WebhookUrl" "http://host.docker.internal:5214/v1/whatsapp/webhooks/evolution"
+```
+
+`5214` is the API's HTTP profile port (`Properties/launchSettings.json`). Use
+plain HTTP, not the `7106` HTTPS profile: the dev certificate is not trusted
+inside the containers and Evolution Go does not skip verification.
+
+### Why there is no WEBHOOK_URL here
+
+Evolution Go has a global webhook env var, and the vendor docs say it "receives
+events from every instance, in addition to the per-instance webhooks". The
+second half is true and the first half is not:
+
+- `whatsmeow.go:2348` gates the **entire** producer call on the *per-instance*
+  webhook being non-empty.
+- `webhook_producer.go:43-48` only then fans out to the global URL **and** the
+  per-instance one.
+
+So `WEBHOOK_URL` alone delivers nothing, and setting both delivers every event
+twice. One shared URL sent through `connect.webhookUrl` is the working shape,
+which is what the service does.
+
+Two more traps worth knowing:
+
+- **`instance.Webhook` is overwritten on every connect** (`instance_service.go:234`),
+  including with an empty value. A connect that omits `webhookUrl` silently turns
+  delivery off. `POST /instance/pair` does not touch it.
+- **`OfflineSyncCompleted` is not delivered under `CONNECTION`**, though the docs
+  list it there and tell you to expect `PairSuccess → Connected → OfflineSyncCompleted`.
+  It has no case in `CallWebhook`'s switch, so it only arrives when you subscribe
+  to `ALL`. `CONNECTION` really carries `Connected`, `PairSuccess`, `LoggedOut`,
+  `Disconnected`, `ConnectFailure` and `TemporaryBan`.
+
+### Webhook-related settings
+
+| Variable | Value here | Why |
+|---|---|---|
+| `WEBHOOK_FILES` | `false` | The vendor default is **true**, which inlines every image, audio and video as base64. We match on text only, and a video would push megabytes at the receiver. |
+| `EVENT_IGNORE_STATUS` | `true` | Status/stories broadcasts are noise for shift matching. |
+| `EVENT_IGNORE_GROUP` | `false` | Must stay false — `true` drops every `@g.us` event before it reaches the webhook. Group messages are the product. |
+| `WEBHOOK_URL` | *unset* | See above. |
+
+### Checking delivery
+
+```bash
+docker logs -f evogo-lt-fixed-1 2>&1 | grep -i webhook
+```
+
+A successful POST logs `webhook sent successfully`. A non-2xx or a refused
+connection logs `webhook failed` and retries **5 times, 30 s apart**, then drops
+the event — there is no dead-letter. If the host is unreachable you will see
+five failures per event and nothing else.
+
+To watch payloads without the service running, point the URL at a throwaway
+receiver instead:
+
+```bash
+docker run --rm -p 8888:80 mendhak/http-https-echo:31
+# then set EvolutionGo:WebhookUrl to http://host.docker.internal:8888/
+```
+
 ## The pool leak test
 
 ```bash

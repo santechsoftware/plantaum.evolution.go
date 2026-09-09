@@ -15,7 +15,7 @@ name: evogo-localtest
 
 x-evo-env: &evo-env
   SERVER_PORT: 8080
-  CLIENT_NAME: evolution
+  CLIENT_NAME: ${CLIENT_NAME:-Plantaum}
   GLOBAL_API_KEY: ${GLOBAL_API_KEY:?set GLOBAL_API_KEY in docker/local-test/.env}
   DATABASE_SAVE_MESSAGES: "false"
   WADEBUG: ${WADEBUG:-INFO}
@@ -25,7 +25,18 @@ x-evo-env: &evo-env
   CONNECT_ON_STARTUP: ${CONNECT_ON_STARTUP:-false}
   MINIO_ENABLED: "false"
   AMQP_GLOBAL_ENABLED: "false"
-  OS_NAME: Evolution GO Local Test
+  OS_NAME: ${OS_NAME:-Plantaum}
+  # Webhooks. WEBHOOK_URL is deliberately absent — see .env for why the
+  # global webhook never fires on its own.
+  WEBHOOK_FILES: ${WEBHOOK_FILES:-false}
+  EVENT_IGNORE_STATUS: ${EVENT_IGNORE_STATUS:-true}
+  EVENT_IGNORE_GROUP: ${EVENT_IGNORE_GROUP:-false}
+
+# The API under test runs on the HOST, not in this stack, so every server needs a
+# route back to it. Docker Desktop resolves host.docker.internal on its own; this
+# mapping is what makes the same compose file work on plain Linux and in WSL.
+x-evo-hosts: &evo-hosts
+  - "host.docker.internal:host-gateway"
 
 # Replica 1 of each side runs migrations; replica 2 waits for it to serve so the
 # two do not race on AutoMigrate against the same database.
@@ -70,6 +81,7 @@ services:
         condition: service_healthy
     ports:
       - "${FIXED_PORT:-8080}:8080"
+    extra_hosts: *evo-hosts
     environment:
       <<: *evo-env
       POSTGRES_AUTH_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/auth_fixed?sslmode=disable&application_name=evo-1
@@ -84,6 +96,7 @@ services:
         condition: service_healthy
     ports:
       - "${FIXED_PORT_2:-8082}:8080"
+    extra_hosts: *evo-hosts
     environment:
       <<: *evo-env
       POSTGRES_AUTH_DB: postgresql://evo_fixed:evo_fixed@postgres:5432/auth_fixed?sslmode=disable&application_name=evo-2
@@ -99,6 +112,7 @@ services:
         condition: service_healthy
     ports:
       - "${BASELINE_PORT:-8081}:8080"
+    extra_hosts: *evo-hosts
     environment:
       <<: *evo-env
       POSTGRES_AUTH_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/auth_baseline?sslmode=disable&application_name=evo-base-1
@@ -113,10 +127,45 @@ services:
         condition: service_healthy
     ports:
       - "${BASELINE_PORT_2:-8083}:8080"
+    extra_hosts: *evo-hosts
     environment:
       <<: *evo-env
       POSTGRES_AUTH_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/auth_baseline?sslmode=disable&application_name=evo-base-2
       POSTGRES_USERS_DB: postgresql://evo_baseline:evo_baseline@postgres:5432/users_baseline?sslmode=disable&application_name=evo-base-2
+
+  # The cache plantaum.service uses. It lives here rather than in a second
+  # compose file because this is the local stack: one `docker compose up -d`
+  # should give the API everything it talks to, and two stacks means two things
+  # to remember to start and one of them silently forgotten.
+  #
+  # No persistence, deliberately. CLAUDE.md 12 says the cache is an
+  # optimization and never a source of truth, so a local cache that survived a
+  # restart would let a developer depend on state production does not promise.
+  # Losing it must be a non-event.
+  redis:
+    image: redis:7-alpine
+    container_name: evogo-lt-redis
+    restart: unless-stopped
+    ports:
+      # Loopback only. A cache reachable from the LAN is a cache someone else's
+      # machine can read and poison.
+      - "${REDIS_PORT:-6379}:6379"
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
 
 volumes:
   pgdata:
